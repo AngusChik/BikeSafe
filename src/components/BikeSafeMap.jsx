@@ -1284,5 +1284,5 @@ const makeParkIcon = () => {
   const ctx=c.getContext('2d'); ctx.fillStyle='#16a34a'
   ctx.beginPath(); ctx.arc(px/2,px/2,22,0,Math.PI*2); ctx.fill()
   ctx.fillStyle='#fff'; ctx.beginPath(); ctx.moveTo(px/2,px/2-14); ctx.lineTo(px/2-13,px/2+4); ctx.lineTo(px/2+13,px/2+4); ctx.closePath(); ctx.fill()
-  ctx.fillRect(px/2-3,px/2+4,6,12); return c
+  ctx.fillRect(px/2-3,px/2+4,6,12); return ctx.getImageData(0, 0, px, px)
 }
