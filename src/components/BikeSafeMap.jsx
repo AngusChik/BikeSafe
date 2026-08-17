@@ -23,9 +23,10 @@ const SAFETY_DISTANCE_WEIGHT = 0.12
 const ROUTE_DIRECTION_ICON_ID = 'route-direction-arrow'
 const SCENIC_SOURCE_ID = 'scenic-route-places'
 const SCENIC_TILE_ZOOM = 14
-const SCENIC_MAX_TILES = 24
+const SCENIC_MAX_TILES = 32
 const SCENIC_CLICK_RADIUS = 20
 const SCENIC_ROUTE_RADIUS_METERS = 1400
+const SCENIC_ROUTE_BUCKETS = 16
 const EMPTY_SCENIC_PLACES = { type:'FeatureCollection', features:[] }
 const SCENIC_PIN_GROUPS = [
   { id:'scenic-nature-pins', label:'Nature & views', shortLabel:'nature', color:'#16a34a', symbol:'N', limit:10, maxRank:8, categories:['park','garden','viewpoint','picnic_site'] },
@@ -1285,11 +1286,11 @@ const ensureScenicPlacesOverlay = (m, data = EMPTY_SCENIC_PLACES) => {
       id:group.id,
       type:'circle',
       source:SCENIC_SOURCE_ID,
-      minzoom:8,
+      minzoom:6,
       filter:['==',['get','scenicGroupId'],group.id],
       layout:{ 'circle-sort-key':['coalesce',['get','rank'],999] },
       paint:{
-        'circle-radius':['interpolate',['linear'],['zoom'],8,7,11,9,14,11,16,13],
+        'circle-radius':['interpolate',['linear'],['zoom'],6,7,8,9,11,11,14,13,16,15],
         'circle-color':group.color,
         'circle-opacity':0.96,
         'circle-stroke-color':'#ffffff',
@@ -1319,6 +1320,35 @@ const lineCoordinates = (feature) => {
 const sampleCoordinates = (coordinates, limit) => {
   if (coordinates.length <= limit) return coordinates
   return Array.from({ length:limit }, (_, index) => coordinates[Math.round(index * (coordinates.length - 1) / (limit - 1))])
+}
+const routeAnchors = (coordinates, limit) => {
+  if (coordinates.length <= 1 || limit <= 1) return coordinates.slice(0, 1)
+  const cumulativeDistances = [0]
+  for (let index = 1; index < coordinates.length; index++) {
+    const [previousLng, previousLat] = coordinates[index - 1]
+    const [lng, lat] = coordinates[index]
+    cumulativeDistances.push(cumulativeDistances[index - 1] + haversineMeters(
+      { lng:previousLng, lat:previousLat },
+      { lng, lat },
+    ))
+  }
+
+  const totalDistance = cumulativeDistances.at(-1) || 0
+  if (!totalDistance) return coordinates.slice(0, 1)
+  let segmentIndex = 1
+  return Array.from({ length:limit }, (_, anchorIndex) => {
+    const targetDistance = totalDistance * anchorIndex / (limit - 1)
+    while (segmentIndex < cumulativeDistances.length - 1 && cumulativeDistances[segmentIndex] < targetDistance) segmentIndex++
+    const segmentStart = cumulativeDistances[segmentIndex - 1]
+    const segmentLength = cumulativeDistances[segmentIndex] - segmentStart
+    const ratio = segmentLength ? (targetDistance - segmentStart) / segmentLength : 0
+    const start = coordinates[segmentIndex - 1]
+    const end = coordinates[segmentIndex]
+    return [
+      start[0] + (end[0] - start[0]) * ratio,
+      start[1] + (end[1] - start[1]) * ratio,
+    ]
+  })
 }
 const lngLatToTile = ([lng, lat], zoom = SCENIC_TILE_ZOOM) => {
   const scale = 2 ** zoom
@@ -1393,15 +1423,19 @@ const fetchScenicTile = async ({ x, y, zoom }, signal) => {
   scenicTileCache.set(cacheKey, features)
   return features
 }
-const distanceToCoordinates = (coordinate, coordinates) => coordinates.reduce((closest, [lng, lat]) => {
+const closestRouteAnchor = (coordinate, coordinates) => coordinates.reduce((closest, [lng, lat], index) => {
   const distance = haversineMeters({ lng:coordinate[0], lat:coordinate[1] }, { lng, lat })
-  return Math.min(closest, distance)
-}, Infinity)
+  return distance < closest.distance ? { distance, index } : closest
+}, { distance:Infinity, index:0 })
+const scenicFeatureScore = (item) => {
+  const named = item.properties['name:latin'] || item.properties.name
+  return item.properties.scenicDistance + (named ? 0 : 350) + (Number(item.properties.rank) || 20) * 15
+}
 const fetchScenicPlaces = async (feature, m, signal) => {
   const routeCoordinates = lineCoordinates(feature)
   const center = m.getCenter()
   const distanceCoordinates = routeCoordinates.length
-    ? sampleCoordinates(routeCoordinates, 80)
+    ? routeAnchors(routeCoordinates, 96)
     : [[center.lng, center.lat]]
   const tileResults = await Promise.allSettled(scenicTilesFor(feature, m).map(tile => fetchScenicTile(tile, signal)))
   if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
@@ -1412,29 +1446,47 @@ const fetchScenicPlaces = async (feature, m, signal) => {
   for (const result of successfulResults) {
     for (const item of result.value) {
       const coordinate = item.geometry.coordinates
-      const distance = distanceToCoordinates(coordinate, distanceCoordinates)
-      if (routeCoordinates.length && distance > SCENIC_ROUTE_RADIUS_METERS) continue
+      const closestAnchor = closestRouteAnchor(coordinate, distanceCoordinates)
+      if (routeCoordinates.length && closestAnchor.distance > SCENIC_ROUTE_RADIUS_METERS) continue
       const properties = item.properties || {}
       const key = `${properties.name || ''}|${properties.class || ''}|${properties.subclass || ''}|${coordinate[0].toFixed(5)}|${coordinate[1].toFixed(5)}`
       if (!uniqueFeatures.has(key)) {
-        uniqueFeatures.set(key, { ...item, properties:{ ...properties, scenicDistance:Math.round(distance) } })
+        const routeProgress = closestAnchor.index / Math.max(1, distanceCoordinates.length - 1)
+        uniqueFeatures.set(key, {
+          ...item,
+          properties:{
+            ...properties,
+            scenicDistance:Math.round(closestAnchor.distance),
+            scenicRouteBucket:Math.min(SCENIC_ROUTE_BUCKETS - 1, Math.floor(routeProgress * SCENIC_ROUTE_BUCKETS)),
+          },
+        })
       }
     }
   }
 
+  const candidates = [...uniqueFeatures.values()].sort((left, right) => scenicFeatureScore(left) - scenicFeatureScore(right))
   const selected = []
+  const selectedFeatures = new Set()
+  const groupCounts = new Map()
+  const addFeature = (item) => {
+    if (!item || selectedFeatures.has(item)) return
+    selectedFeatures.add(item)
+    selected.push(item)
+    const groupId = item.properties.scenicGroupId
+    groupCounts.set(groupId, (groupCounts.get(groupId) || 0) + 1)
+  }
+
+  if (routeCoordinates.length) {
+    for (let bucket = 0; bucket < SCENIC_ROUTE_BUCKETS; bucket++) {
+      addFeature(candidates.find(item => item.properties.scenicRouteBucket === bucket))
+    }
+  }
+
   for (const group of SCENIC_PIN_GROUPS) {
-    const matches = [...uniqueFeatures.values()]
-      .filter(item => item.properties.scenicGroupId === group.id)
-      .sort((left, right) => {
-        const leftNamed = left.properties['name:latin'] || left.properties.name
-        const rightNamed = right.properties['name:latin'] || right.properties.name
-        const leftScore = left.properties.scenicDistance + (leftNamed ? 0 : 350) + (Number(left.properties.rank) || 20) * 15
-        const rightScore = right.properties.scenicDistance + (rightNamed ? 0 : 350) + (Number(right.properties.rank) || 20) * 15
-        return leftScore - rightScore
-      })
-      .slice(0, group.limit)
-    selected.push(...matches)
+    for (const item of candidates) {
+      if ((groupCounts.get(group.id) || 0) >= group.limit) break
+      if (item.properties.scenicGroupId === group.id) addFeature(item)
+    }
   }
 
   return { type:'FeatureCollection', features:selected }
