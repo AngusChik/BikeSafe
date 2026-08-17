@@ -18,7 +18,14 @@ const ORS_BASE     = import.meta.env.DEV ? '/ors' : 'https://api.openrouteservic
 const DEFAULT_CENTER = [-79.6440, 43.5890]
 const DEFAULT_ZOOM   = 12
 const SAFETY_DISTANCE_WEIGHT = 0.12
-const SCENIC_LAYER_IDS = ['parks-fill', 'parks-outline', 'parks-icon']
+const SCENIC_PIN_GROUPS = [
+  { id:'scenic-nature-pins', label:'Nature & views', shortLabel:'nature', color:'#16a34a', symbol:'N', minzoom:14, maxRank:8, categories:['park','garden','viewpoint','picnic_site'] },
+  { id:'scenic-place-pins', label:'Plazas & sights', shortLabel:'plazas & sights', color:'#8b5cf6', symbol:'P', minzoom:14, maxRank:10, categories:['mall','marketplace','attraction','museum','gallery','artwork','monument','arts_centre'] },
+  { id:'scenic-cafe-pins', label:'Cafés & treats', shortLabel:'cafés', color:'#ea580c', symbol:'C', minzoom:14, maxRank:15, categories:['cafe','bakery','ice_cream'] },
+  { id:'scenic-cyclist-pins', label:'Cyclist essentials', shortLabel:'bike stops', color:'#0284c7', symbol:'B', minzoom:14, categories:['bicycle','bicycle_rental','drinking_water','toilets','shelter'] },
+]
+const SCENIC_PIN_LAYER_IDS = SCENIC_PIN_GROUPS.map(group => group.id)
+const SCENIC_LAYER_IDS = [...SCENIC_PIN_LAYER_IDS]
 
 const http = async (url, opts = {}, timeout = 20000) => {
   const ctl = new AbortController()
@@ -50,6 +57,7 @@ export default function BikeSafeMap(){
   const panelRef = useRef(null)
   const qrRef = useRef(null)
   const popupRef = useRef(null)
+  const scenicPopupRef = useRef(null)
 
   const hoveredRidRef = useRef(-1)
   const routeCoordsRef = useRef([])
@@ -123,6 +131,7 @@ export default function BikeSafeMap(){
           setMap(m)
           setMapReady(true)
           popupRef.current = new maplibregl.Popup({ closeButton:false, closeOnClick:false, offset:8, maxWidth:'280px' })
+          scenicPopupRef.current = new maplibregl.Popup({ closeButton:true, closeOnClick:true, offset:18, maxWidth:'260px' })
         })
         m.on('error', (e) => setErr(e?.error?.message || 'Map error — check MapTiler key.'))
       }catch{ setErr('Failed to init map. Check keys/network.') }
@@ -323,13 +332,38 @@ export default function BikeSafeMap(){
   useEffect(() => {
     if (!map) return
     const syncScenicPlaces = () => {
-      if (showScenicPlaces) ensureParksOverlay(map)
+      if (showScenicPlaces) ensureScenicPlacesOverlay(map)
       setScenicPlacesVisibility(map, showScenicPlaces)
+      if (!showScenicPlaces) scenicPopupRef.current?.remove()
     }
     syncScenicPlaces()
     map.on('styledata', syncScenicPlaces)
     return () => map.off('styledata', syncScenicPlaces)
   }, [map, showScenicPlaces])
+
+  useEffect(() => {
+    if (!map) return
+    const onPinClick = (event) => {
+      const feature = event.features?.find(item => item.properties?.['name:latin'] || item.properties?.name) || event.features?.[0]
+      const group = SCENIC_PIN_GROUPS.find(item => item.id === feature?.layer?.id)
+      if (!feature || !group || !scenicPopupRef.current) return
+      scenicPopupRef.current
+        .setLngLat(event.lngLat)
+        .setDOMContent(createScenicPopupContent(feature, group))
+        .addTo(map)
+    }
+    const onPinEnter = () => { map.getCanvas().style.cursor = 'pointer' }
+    const onPinLeave = () => { map.getCanvas().style.cursor = '' }
+
+    map.on('click', SCENIC_PIN_LAYER_IDS, onPinClick)
+    map.on('mouseenter', SCENIC_PIN_LAYER_IDS, onPinEnter)
+    map.on('mouseleave', SCENIC_PIN_LAYER_IDS, onPinLeave)
+    return () => {
+      map.off('click', SCENIC_PIN_LAYER_IDS, onPinClick)
+      map.off('mouseenter', SCENIC_PIN_LAYER_IDS, onPinEnter)
+      map.off('mouseleave', SCENIC_PIN_LAYER_IDS, onPinLeave)
+    }
+  }, [map])
 
 
   // hover popup for risk segments
@@ -1025,12 +1059,24 @@ async function fetchDesignatedRoutes(o, d) {
             Show cycle paths overlay
           </label>
           <label style={{ display:'inline-flex', gap:8, alignItems:'center', fontSize:14 }}>
-            <input type="checkbox" checked={showScenicPlaces} onChange={e => setShowScenicPlaces(e.target.checked)} aria-label="Toggle scenic places overlay" style={{flex:'0 0 auto'}} />
+            <input type="checkbox" checked={showScenicPlaces} onChange={e => {
+              const visible = e.target.checked
+              setShowScenicPlaces(visible)
+              if (visible && map?.getZoom() < 14) map.easeTo({zoom:14, duration:700})
+            }} aria-label="Toggle scenic places overlay" style={{flex:'0 0 auto'}} />
             Show scenic places
           </label>
           {showScenicPlaces && (
-            <div role="status" style={{fontSize:12, color:'#86efac'}}>
-              Highlighting parks, gardens, nature reserves, and protected areas.
+            <div role="status" style={{fontSize:12, color:'#b7c7dc'}}>
+              <div style={{color:'#86efac', marginBottom:4}}>Highlighting parks and cyclist-friendly places.</div>
+              <div style={{display:'flex', flexWrap:'wrap', gap:'4px 10px'}}>
+                {SCENIC_PIN_GROUPS.map(group => (
+                  <span key={group.id} style={{display:'inline-flex', alignItems:'center', gap:4}}>
+                    <i aria-hidden="true" style={{display:'inline-flex', alignItems:'center', justifyContent:'center', width:16, height:16, borderRadius:'50%', background:group.color, color:'#fff', fontStyle:'normal', fontSize:9, fontWeight:800}}>{group.symbol}</i>
+                    {group.shortLabel}
+                  </span>
+                ))}
+              </div>
             </div>
           )}
         </div>
@@ -1115,20 +1161,40 @@ const anyVectorSource = (m) => {
   const srcs = m.getStyle()?.sources || {}
   return Object.keys(srcs).find(k => srcs[k].type === 'vector')
 }
-const ensureParksOverlay = (m) => {
+const ensureScenicPlacesOverlay = (m) => {
   const style = m.getStyle() || {}
   const layers = style.layers || []
-  const land = layers.find(L => L.type==='fill' && L['source-layer']==='landuse')
-  const src = land?.source || anyVectorSource(m); if (!src) return
-  const layer = land?.['source-layer'] || 'landuse'
-  const parkFilter = ['any',['match',['get','class'],['park','recreation_ground','garden','nature_reserve','protected_area'],true,false],['==',['get','subclass'],'park']]
-  if (!m.hasImage('park-icon')) m.addImage('park-icon', makeParkIcon(), { pixelRatio:2 })
-  if (!m.getLayer('parks-fill')) m.addLayer({ id:'parks-fill', type:'fill', source:src, 'source-layer':layer, filter:parkFilter, paint:{ 'fill-color':'#22c55e','fill-opacity':0.45 } })
-  if (!m.getLayer('parks-outline')) m.addLayer({ id:'parks-outline', type:'line', source:src, 'source-layer':layer, filter:parkFilter, paint:{ 'line-color':'#16a34a','line-width':2,'line-dasharray':[2,2],'line-opacity':0.9 } })
-  if (!m.getLayer('parks-icon')) m.addLayer({
-    id:'parks-icon', type:'symbol', source:src, 'source-layer':layer, filter:parkFilter, minzoom:10,
-    layout:{ 'icon-image':'park-icon','icon-size':['interpolate',['linear'],['zoom'],10,0.9,12,1.0,15,1.2],'icon-allow-overlap':true,'icon-ignore-placement':true,'symbol-placement':'point','icon-offset':[0,-2] }
-  })
+  const poiLayer = layers.find(item => item['source-layer'] === 'poi')
+  const src = poiLayer?.source || anyVectorSource(m); if (!src) return
+
+  for (const group of SCENIC_PIN_GROUPS) {
+    if (m.getLayer(group.id)) continue
+    const filter = [
+      'all',
+      ['==',['geometry-type'],'Point'],
+      ['any',
+        ['in',['get','class'],['literal',group.categories]],
+        ['in',['get','subclass'],['literal',group.categories]],
+      ],
+      ...(group.maxRank ? [['<=',['get','rank'],group.maxRank]] : []),
+    ]
+    m.addLayer({
+      id:group.id,
+      type:'circle',
+      source:src,
+      'source-layer':'poi',
+      minzoom:group.minzoom,
+      filter,
+      layout:{ 'circle-sort-key':['coalesce',['get','rank'],999] },
+      paint:{
+        'circle-radius':['interpolate',['linear'],['zoom'],11,5,14,7,16,9],
+        'circle-color':group.color,
+        'circle-opacity':0.96,
+        'circle-stroke-color':'#ffffff',
+        'circle-stroke-width':2,
+      },
+    })
+  }
 }
 const setScenicPlacesVisibility = (m, visible) => {
   const visibility = visible ? 'visible' : 'none'
@@ -1138,10 +1204,21 @@ const setScenicPlacesVisibility = (m, visible) => {
     }
   }
 }
-const makeParkIcon = () => {
-  const px=64, c=document.createElement('canvas'); c.width=c.height=px
-  const ctx=c.getContext('2d'); ctx.fillStyle='#16a34a'
-  ctx.beginPath(); ctx.arc(px/2,px/2,22,0,Math.PI*2); ctx.fill()
-  ctx.fillStyle='#fff'; ctx.beginPath(); ctx.moveTo(px/2,px/2-14); ctx.lineTo(px/2-13,px/2+4); ctx.lineTo(px/2+13,px/2+4); ctx.closePath(); ctx.fill()
-  ctx.fillRect(px/2-3,px/2+4,6,12); return ctx.getImageData(0, 0, px, px)
+const createScenicPopupContent = (feature, group) => {
+  const properties = feature.properties || {}
+  const name = properties['name:latin'] || properties.name || group.label
+  const detail = String(properties.subclass || properties.class || group.label).replaceAll('_',' ')
+  const card = document.createElement('div')
+  Object.assign(card.style, { font:'13px system-ui', color:'#102033', lineHeight:'1.35', minWidth:'150px' })
+  const category = document.createElement('div')
+  category.textContent = group.label
+  Object.assign(category.style, { color:group.color, fontSize:'11px', fontWeight:'800', textTransform:'uppercase', letterSpacing:'.04em', marginBottom:'4px' })
+  const title = document.createElement('div')
+  title.textContent = name
+  Object.assign(title.style, { fontWeight:'800', fontSize:'14px', marginBottom:'3px' })
+  const subtitle = document.createElement('div')
+  subtitle.textContent = detail
+  Object.assign(subtitle.style, { color:'#475569', textTransform:'capitalize' })
+  card.append(category, title, subtitle)
+  return card
 }
