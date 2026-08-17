@@ -20,6 +20,7 @@ const ORS_BASE     = import.meta.env.DEV ? '/ors' : 'https://api.openrouteservic
 const DEFAULT_CENTER = [-79.6440, 43.5890]
 const DEFAULT_ZOOM   = 12
 const SAFETY_DISTANCE_WEIGHT = 0.12
+const ORS_MAX_ALTERNATIVE_ROUTES = 3
 const ROUTE_DIRECTION_ICON_ID = 'route-direction-arrow'
 const SCENIC_SOURCE_ID = 'scenic-route-places'
 const SCENIC_TILE_ZOOM = 14
@@ -39,10 +40,22 @@ const SCENIC_LAYER_IDS = [...SCENIC_PIN_LAYER_IDS]
 const scenicTileCache = new Map()
 
 const http = async (url, opts = {}, timeout = 20000) => {
-  const ctl = new AbortController()
-  const id = setTimeout(()=>ctl.abort(), timeout)
-  try { return await fetch(url, { ...opts, signal: ctl.signal }) }
-  finally { clearTimeout(id) }
+  const controller = new AbortController()
+  const { signal:parentSignal, ...fetchOptions } = opts
+  const abortFromParent = () => controller.abort(parentSignal?.reason || new DOMException('Request cancelled.', 'AbortError'))
+  if (parentSignal?.aborted) abortFromParent()
+  else parentSignal?.addEventListener('abort', abortFromParent, { once:true })
+  const timeoutError = new DOMException(`Request timed out after ${Math.ceil(timeout / 1000)} seconds.`, 'TimeoutError')
+  const id = setTimeout(() => controller.abort(timeoutError), timeout)
+  try {
+    return await fetch(url, { ...fetchOptions, signal:controller.signal })
+  } catch (error) {
+    if (controller.signal.aborted) throw controller.signal.reason || error
+    throw error
+  } finally {
+    clearTimeout(id)
+    parentSignal?.removeEventListener('abort', abortFromParent)
+  }
 }
 
 // Prefer user's location for initial map center; fall back to Mississauga if unavailable/denied.
@@ -80,6 +93,7 @@ export default function BikeSafeMap(){
   const originMarkerRef = useRef(null)
   const destMarkerRef = useRef(null)
   const routeDebounceRef = useRef(null)
+  const routingControllerRef = useRef(null)
 
   const [map, setMap] = useState(null)
   const [originText, setOriginText] = useState('')
@@ -405,7 +419,7 @@ export default function BikeSafeMap(){
         setScenicPlacesStatus(previous => ({ ...previous, loading:false, error:'Scenic pins are unavailable right now.' }))
       })
 
-    return () => controller.abort()
+    return () => controller.abort(new DOMException('Scenic pin request cancelled.', 'AbortError'))
   }, [map, showScenicPlaces, routes, activeRouteIdx])
 
   useEffect(() => {
@@ -703,14 +717,14 @@ export default function BikeSafeMap(){
     if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null
     return { lat, lng }
   }
-  const geocode = async (q) => {
+  const geocode = async (q, signal) => {
     const ll = parseLatLng(q); if (ll) return { lng: ll.lng, lat: ll.lat }
     if (!MAPTILER_KEY) throw new Error('To search by address, set VITE_MAPTILER_KEY')
     const params = new URLSearchParams({ key: MAPTILER_KEY, limit: '1' })
     if (biasProximity?.length===2) params.set('proximity', `${biasProximity[0]},${biasProximity[1]}`)
     if (biasBBox?.length===4) params.set('bbox', biasBBox.join(','))
     const url = `https://api.maptiler.com/geocoding/${encodeURIComponent(String(q))}.json?${params}`
-    const res = await http(url, { headers:{ accept:'application/json' } }, 12000)
+    const res = await http(url, { headers:{ accept:'application/json' }, signal }, 12000)
     if (!res.ok) throw new Error(`Place search failed (${res.status})`)
     const data = await res.json()
     const feat = data?.features?.[0]; if (!feat?.center) throw new Error('Place not found')
@@ -732,7 +746,7 @@ export default function BikeSafeMap(){
 
 
 // --- Robust ORS request with profile + fallbacks for common 400s
-const orsPost = async (body, profile = 'cycling-regular') => {
+const orsPost = async (body, profile = 'cycling-regular', signal) => {
   const apiKey = ORS_KEY || import.meta.env.VITE_ORS_KEY
   if (!apiKey) throw new Error('Missing OpenRouteService key (VITE_ORS_KEY)')
   const baseURL = `${ORS_BASE}/v2/directions/${profile}/geojson`
@@ -743,7 +757,7 @@ const orsPost = async (body, profile = 'cycling-regular') => {
   }
 
   const doFetch = async (b) => {
-    const res = await http(baseURL, { method:'POST', headers, body: JSON.stringify(b) }, 20000)
+    const res = await http(baseURL, { method:'POST', headers, body: JSON.stringify(b), signal }, 20000)
     const text = await res.text()
     const ct = (res.headers.get('content-type') || '').toLowerCase()
     const json = ct.includes('json') ? JSON.parse(text) : null
@@ -779,9 +793,9 @@ const orsPost = async (body, profile = 'cycling-regular') => {
       cur = { ...cur, options }
       continue
     }
-    if (res.status === 400 && /alternative_routes/i.test(msg) && cur?.options?.alternative_routes) {
-      const options = { ...(cur.options || {}) }; delete options.alternative_routes
-      cur = { ...cur, options }
+    if (res.status === 400 && /alternative_routes/i.test(msg) && cur?.alternative_routes) {
+      const next = { ...cur }; delete next.alternative_routes
+      cur = next
       continue
     }
     const safeMsg = res.status === 400 ? 'Bad routing request' : res.status === 403 ? 'API key invalid or expired' : res.status === 429 ? 'Rate limit exceeded — try again shortly' : `Routing service error (${res.status})`
@@ -801,26 +815,30 @@ async function fetchORSWithAlts(o, d, {
   steepnessDifficulty = 1,
   avoidFeatures,
   shareFactor = 0.6,
+  signal,
 } = {}) {
+  const targetCount = Math.max(1, Math.min(ORS_MAX_ALTERNATIVE_ROUTES, Math.trunc(altCount)))
   const body = {
     coordinates: [[o.lng,o.lat],[d.lng,d.lat]],
     preference,
     elevation: true,
     instructions: true,
     instructions_format: 'text',
-    extra_info: ['steepness','surface','waytype','suitability','avgspeed','waycategory'],
+    extra_info: ['steepness','surface','waytype','suitability','waycategory'],
     options: {
       profile_params: { weightings: { steepness_difficulty: steepnessDifficulty } },
       ...(avoidFeatures?.length ? { avoid_features: avoidFeatures } : {}),
-      alternative_routes: altCount > 1 ? {
-        target_count: altCount,
+    },
+    ...(targetCount > 1 ? {
+      alternative_routes: {
+        target_count: targetCount,
         share_factor: shareFactor,
         weight_factor: weightFactor
-      } : undefined
-    }
+      }
+    } : {})
   }
 
-  const json = await orsPost(body, profile)
+  const json = await orsPost(body, profile, signal)
   const feats = (json?.features || []).filter(feature => routeRunsStartToDestination(feature, o, d)).map(f => {
     f.properties = { ...(f.properties||{}), _preference: preference, _profile: profile, _directionChecked:true }
     return f
@@ -859,31 +877,25 @@ const rankSafestCandidate = (candidates, shortestDist, scoreRisk) => {
   ))[0]?.feature ?? null
 }
 
-async function fetchDesignatedRoutes(o, d) {
-  // A) Seed the candidate set with ORS shortest-path routes.
-  const shortestList = await fetchORSWithAlts(o, d, { profile:'cycling-road', preference:'shortest', altCount:3 })
+async function fetchDesignatedRoutes(o, d, signal) {
+  // A) Fetch the strict shortest route and safest candidate pool in parallel.
+  const [shortestResult, safeResult] = await Promise.allSettled([
+    fetchORSWithAlts(o, d, { profile:'cycling-road', preference:'shortest', altCount:1, signal }),
+    fetchORSWithAlts(o, d, { profile:'cycling-regular', preference:'recommended', altCount:3, weightFactor:1.8,
+      steepnessDifficulty:2, avoidFeatures:['steps','ferries','fords'], signal }),
+  ])
+  if (shortestResult.status === 'rejected') throw shortestResult.reason
+  const shortestList = shortestResult.value
   if (!shortestList.length) throw new Error('No route (shortest)')
 
-  // B) Pools for weighted re-ranking
-  let poolWarning = null
-  const results = await Promise.allSettled([
-    fetchORSWithAlts(o, d, { profile:'cycling-road',    preference:'recommended', altCount:8, weightFactor:3.0, shareFactor:0.4 }),
-    fetchORSWithAlts(o, d, { profile:'cycling-road',    preference:'recommended', altCount:6, weightFactor:2.2, shareFactor:0.4 }),
-    fetchORSWithAlts(o, d, { profile:'cycling-regular', preference:'recommended', altCount:6, weightFactor:1.8,
-      steepnessDifficulty:2, avoidFeatures:['steps','ferries','fords'] }),
-  ])
-  const roadAlts1 = results[0].status === 'fulfilled' ? results[0].value : []
-  const roadAlts2 = results[1].status === 'fulfilled' ? results[1].value : []
-  const safeAlts  = results[2].status === 'fulfilled' ? results[2].value : []
-  const failCount = results.filter(r => r.status === 'rejected').length
-  if (failCount > 0) poolWarning = `${failCount} alternative route pool${failCount > 1 ? 's' : ''} unavailable — some options may be limited.`
-
-  const roadPool = byDistinctness([...roadAlts1, ...roadAlts2])
+  // B) Re-rank the cycling-regular alternatives using BikeSafe's risk model.
+  let poolWarning = safeResult.status === 'rejected' ? 'Safest route pool unavailable — only the shortest route may be shown.' : null
+  const safeAlts = safeResult.status === 'fulfilled' ? safeResult.value : []
   const safePool = byDistinctness(safeAlts)
 
-  // C) Shortest is the minimum-distance path across every generated candidate.
-  const routeCandidates = byDistinctness([...shortestList, ...safePool, ...roadPool])
-  const shortest = [...routeCandidates].sort(compareByNumber(
+  // C) Shortest is selected only from the cycling-road shortest-path response.
+  const routeCandidates = byDistinctness([...shortestList, ...safePool])
+  const shortest = [...shortestList].sort(compareByNumber(
     (feature) => distanceOf(feature),
     (feature) => riskScore(feature, 'shortest'),
   ))[0]
@@ -921,18 +933,21 @@ async function fetchDesignatedRoutes(o, d) {
   // routing (uses designated routes)
   const route = async (overrides = {}) => {
     if(!map) return
+    routingControllerRef.current?.abort(new DOMException('A newer route request started.', 'AbortError'))
+    const controller = new AbortController()
+    routingControllerRef.current = controller
     setErr(null); setPoolWarning(null); setInsights(null); setRiskMix(null); setRiskBands([]); setDirections([]); setRouting(true)
     setActivePicker(null)
     try{
-      const o = overrides.origin || originCoord || (originText ? await geocode(originText) : null)
-      const d = overrides.dest   || destCoord   || (destText   ? await geocode(destText)   : null)
+      const o = overrides.origin || originCoord || (originText ? await geocode(originText, controller.signal) : null)
+      const d = overrides.dest   || destCoord   || (destText   ? await geocode(destText, controller.signal)   : null)
       if(!o || !d) throw new Error('Enter origin and destination')
       if (haversineMeters(o, d) < 8) throw new Error('Start and destination are the same point')
 
       setOriginCoord(o); setDestCoord(d)
       addOrMoveMarker('origin', o); addOrMoveMarker('dest', d)
 
-      const { routes: features, poolWarning: pw } = await fetchDesignatedRoutes(o, d)
+      const { routes: features, poolWarning: pw } = await fetchDesignatedRoutes(o, d, controller.signal)
       if (!Array.isArray(features) || !features.length) throw new Error('No route found')
       if (pw) setPoolWarning(pw)
 
@@ -956,8 +971,14 @@ async function fetchDesignatedRoutes(o, d) {
 
       setAcResetKey(k => k + 1)
     }catch(e){
+      if (e?.name === 'AbortError') return
       setErr(e?.message || 'Routing failed')
-    }finally{ setRouting(false) }
+    }finally{
+      if (routingControllerRef.current === controller) {
+        routingControllerRef.current = null
+        setRouting(false)
+      }
+    }
   }
 
   // camera + cursor + steps
