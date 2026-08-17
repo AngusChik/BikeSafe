@@ -6,8 +6,8 @@ import GeoAutocomplete from './GeoAutocomplete.jsx'
 import RouteInsights from './RouteInsights.jsx'
 import {
   haversineMeters, toRiskFCRaw, routeSig,
-  riskScore as riskScoreRaw, scenicScore as scenicScoreRaw,
-  getInsights, distanceOf, isSameRoute, routeOverlap,
+  riskScore as riskScoreRaw,
+  getInsights, distanceOf, isSameRoute,
   byDistinctness, cloneAndLabel, wayLabel, INFRA_LABEL,
 } from '../utils/scoring.js'
 
@@ -18,12 +18,7 @@ const ORS_BASE     = import.meta.env.DEV ? '/ors' : 'https://api.openrouteservic
 const DEFAULT_CENTER = [-79.6440, 43.5890]
 const DEFAULT_ZOOM   = 12
 const SAFETY_DISTANCE_WEIGHT = 0.12
-const SCENIC_SCORE_WEIGHT = 0.58
-const SCENIC_DISTANCE_WEIGHT = 0.27
-const SCENIC_SAFETY_WEIGHT = 0.15
-const SCENIC_MIN_DETOUR = 1.12
-const SCENIC_TARGET_DETOUR = 1.32
-const SCENIC_MAX_DETOUR = 1.75
+const SCENIC_LAYER_IDS = ['parks-fill', 'parks-outline', 'parks-icon']
 
 const http = async (url, opts = {}, timeout = 20000) => {
   const ctl = new AbortController()
@@ -84,6 +79,7 @@ export default function BikeSafeMap(){
   const [mapReady, setMapReady] = useState(false)
 
   const [showCyclePaths, setShowCyclePaths] = useState(false)
+  const [showScenicPlaces, setShowScenicPlaces] = useState(false)
   const CYCLE_LAYER_ID = 'cycle-paths-overlay'
   const CYCLE_CASING_ID = 'cycle-paths-overlay-casing'
 
@@ -91,7 +87,7 @@ export default function BikeSafeMap(){
   const [biasBBox, setBiasBBox] = useState(null)
   const [acResetKey, setAcResetKey] = useState(0)
 
-  const [routes, setRoutes] = useState([])   // exactly 3 designated routes
+  const [routes, setRoutes] = useState([])   // Shortest and Safest
   const [routeInsightsCache, setRouteInsightsCache] = useState([]) // cached getInsights per route
   const [activeRouteIdx, setActiveRouteIdx] = useState(0)
   const riskFCCache = useRef(new Map())  // cache toRiskFC results keyed by routeSig
@@ -127,7 +123,6 @@ export default function BikeSafeMap(){
           setMap(m)
           setMapReady(true)
           popupRef.current = new maplibregl.Popup({ closeButton:false, closeOnClick:false, offset:8, maxWidth:'280px' })
-          ensureParksOverlay(m)
         })
         m.on('error', (e) => setErr(e?.error?.message || 'Map error — check MapTiler key.'))
       }catch{ setErr('Failed to init map. Check keys/network.') }
@@ -208,7 +203,7 @@ export default function BikeSafeMap(){
     if (!map || !routes?.length || !map.isStyleLoaded?.()) return
 
     try {
-      // draw 3 designated routes; dim those not active
+      // draw designated routes; dim those not active
       routes.forEach((feat, idx) => {
         const src = `route-${idx}`
         const id  = `route-line-${idx}`
@@ -324,13 +319,17 @@ export default function BikeSafeMap(){
     }
   }, [map, routes, activeRouteIdx])
 
-// re-add parks overlay if style reloads (like we do for cycle paths)
-useEffect(() => {
-  if (!map) return
-  const tryParks = () => ensureParksOverlay(map)
-  map.on('styledata', tryParks)
-  return () => map.off('styledata', tryParks)
-}, [map])
+  // show scenic places only when the user asks for them
+  useEffect(() => {
+    if (!map) return
+    const syncScenicPlaces = () => {
+      if (showScenicPlaces) ensureParksOverlay(map)
+      setScenicPlacesVisibility(map, showScenicPlaces)
+    }
+    syncScenicPlaces()
+    map.on('styledata', syncScenicPlaces)
+    return () => map.off('styledata', syncScenicPlaces)
+  }, [map, showScenicPlaces])
 
 
   // hover popup for risk segments
@@ -602,9 +601,8 @@ useEffect(() => {
     if (result) riskFCCache.current.set(key, result)
     return result
   }
-  // riskScore / scenicScore wrappers that use the cached toRiskFC
+  // riskScore wrapper that uses the cached toRiskFC
   const riskScore = (feature, routeType) => riskScoreRaw(feature, toRiskFC, routeType)
-  const scenicScore = (feature) => scenicScoreRaw(feature, toRiskFC, (coords) => envBonusNear(map, coords, 28))
 
 
 // --- Robust ORS request with profile + fallbacks for common 400s
@@ -706,89 +704,6 @@ async function fetchORSWithAlts(o, d, {
 
 
 
-// --- Scenic / environment helpers (map-dependent, so they stay here) ------
-
-const waterLayerIds = (m) => {
-  const layers = m?.getStyle()?.layers || []
-  return layers
-    .filter(L => /water/i.test(L.id) && (L.type === 'fill' || L.type === 'line'))
-    .map(L => L.id)
-}
-
-const envBonusNear = (m, coords, pxRadius = 28) => {
-  if (!m || !m.isStyleLoaded?.() || !coords?.length) return 0
-
-  const parksLayerExists = !!m.getLayer('parks-fill')
-  const wIds = waterLayerIds(m)
-  const landuseLayerIds = (!parksLayerExists)
-    ? (m.getStyle()?.layers || []).filter(L => L['source-layer'] === 'landuse').map(L => L.id)
-    : []
-
-  const queryAt = (coord) => {
-    const pt = m.project([coord[0], coord[1]])
-    if (!pt) return 0
-    const bbox = [
-      { x: pt.x - pxRadius, y: pt.y - pxRadius },
-      { x: pt.x + pxRadius, y: pt.y + pxRadius }
-    ]
-    let b = 0
-    const layersToQuery = []
-    if (parksLayerExists) layersToQuery.push('parks-fill')
-    if (wIds.length) layersToQuery.push(...wIds)
-
-    if (layersToQuery.length) {
-      const feats = m.queryRenderedFeatures(bbox, { layers: layersToQuery })
-      if (parksLayerExists && feats.some(f => f.layer?.id === 'parks-fill')) b += 3.0
-      if (wIds.length && feats.some(f => wIds.includes(f.layer?.id))) b += 2.0
-      return b
-    }
-
-    if (landuseLayerIds.length) {
-      const feats = m.queryRenderedFeatures(bbox, { layers: landuseLayerIds })
-      const isParky = (p) =>
-        ['park','recreation_ground','garden','nature_reserve','protected_area'].includes(p?.class) ||
-        p?.subclass === 'park'
-      if (feats.some(f => isParky(f.properties || {}))) b += 3.0
-    }
-    if (wIds.length) {
-      const wfeats = m.queryRenderedFeatures(bbox, { layers: wIds })
-      if (wfeats?.length) b += 2.0
-    }
-    return b
-  }
-
-  try {
-    const maxSamples = 5
-    const step = Math.max(1, Math.floor(coords.length / maxSamples))
-    let total = 0, count = 0
-    for (let i = 0; i < coords.length; i += step) {
-      total += queryAt(coords[i])
-      count++
-    }
-    return count > 0 ? total / count : 0
-  } catch {
-    return 0
-  }
-}
-
-const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
-
-const normalizedValue = (value, min, max) => {
-  if (!Number.isFinite(value)) return 0
-  if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return 0.5
-  return clamp((value - min) / (max - min), 0, 1)
-}
-
-const scoreDistanceFit = (detourFactor, targetFactor = SCENIC_TARGET_DETOUR, maxFactor = SCENIC_MAX_DETOUR) => {
-  if (!Number.isFinite(detourFactor) || detourFactor < 1 || detourFactor > maxFactor) return 0
-  if (detourFactor < SCENIC_MIN_DETOUR) {
-    return clamp((detourFactor - 1) / Math.max(0.001, SCENIC_MIN_DETOUR - 1), 0, 1) * 0.7
-  }
-  const span = Math.max(0.001, maxFactor - SCENIC_MIN_DETOUR)
-  const distanceFromTarget = Math.abs(detourFactor - targetFactor)
-  return 1 - clamp(distanceFromTarget / span, 0, 1)
-}
-
 const compareByNumber = (...getters) => (left, right) => {
   for (const getter of getters) {
     const diff = getter(left) - getter(right)
@@ -818,75 +733,10 @@ const rankSafestCandidate = (candidates, shortestDist, scoreRisk) => {
   ))[0]?.feature ?? null
 }
 
-const rankScenicCandidate = (candidates, shortestDist, shortestRoute, safestRoute, scoreRisk, scoreScenic) => {
-  if (!candidates.length) return null
-
-  const metrics = candidates
-    .map((feature) => {
-      const distance = distanceOf(feature)
-      const detourFactor = shortestDist > 0 ? distance / shortestDist : 1
-      const scenic = scoreScenic(feature)
-      const safety = scoreRisk(feature, 'scenic')
-      const overlapPenalty = Math.max(
-        routeOverlap(feature, shortestRoute),
-        routeOverlap(feature, safestRoute),
-      )
-
-      return {
-        feature,
-        distance,
-        detourFactor,
-        scenic,
-        safety,
-        overlapPenalty,
-        distanceFit: scoreDistanceFit(detourFactor),
-      }
-    })
-    .filter((item) => item.scenic != null && item.detourFactor <= SCENIC_MAX_DETOUR)
-
-  if (!metrics.length) return null
-
-  const scenicValues = metrics.map((item) => item.scenic)
-  const safetyValues = metrics.map((item) => item.safety)
-  const scenicMin = Math.min(...scenicValues)
-  const scenicMax = Math.max(...scenicValues)
-  const safetyMin = Math.min(...safetyValues)
-  const safetyMax = Math.max(...safetyValues)
-
-  return metrics
-    .map((item) => {
-      const scenicNorm = normalizedValue(item.scenic, scenicMin, scenicMax)
-      const safetyNorm = 1 - normalizedValue(item.safety, safetyMin, safetyMax)
-      const overlapPenalty = clamp(item.overlapPenalty, 0, 1) * 0.2
-
-      return {
-        ...item,
-        weightedScore:
-          scenicNorm * SCENIC_SCORE_WEIGHT +
-          item.distanceFit * SCENIC_DISTANCE_WEIGHT +
-          safetyNorm * SCENIC_SAFETY_WEIGHT -
-          overlapPenalty,
-      }
-    })
-    .sort(compareByNumber(
-      (item) => -item.weightedScore,
-      (item) => item.overlapPenalty,
-      (item) => item.safety,
-      (item) => -item.distance,
-    ))[0]?.feature ?? null
-}
-
-
-
-async function fetchThreeRoutes(o, d) {
-  // A) Shortest — exact shortest path, with safety only as a strict tie-break
+async function fetchDesignatedRoutes(o, d) {
+  // A) Seed the candidate set with ORS shortest-path routes.
   const shortestList = await fetchORSWithAlts(o, d, { profile:'cycling-road', preference:'shortest', altCount:3 })
   if (!shortestList.length) throw new Error('No route (shortest)')
-  const shortest = [...shortestList].sort(compareByNumber(
-    (feature) => distanceOf(feature),
-    (feature) => riskScore(feature, 'shortest'),
-  ))[0]
-  const shortestDist = distanceOf(shortest)
 
   // B) Pools for weighted re-ranking
   let poolWarning = null
@@ -905,26 +755,20 @@ async function fetchThreeRoutes(o, d) {
   const roadPool = byDistinctness([...roadAlts1, ...roadAlts2])
   const safePool = byDistinctness(safeAlts)
 
-  // C) Safest: weighted toward minimum risk, with distance as a small penalty
-  const safestCandidates = byDistinctness([...shortestList, ...safePool, ...roadPool])
-  const safest = rankSafestCandidate(safestCandidates, shortestDist, riskScore) || shortest
+  // C) Shortest is the minimum-distance path across every generated candidate.
+  const routeCandidates = byDistinctness([...shortestList, ...safePool, ...roadPool])
+  const shortest = [...routeCandidates].sort(compareByNumber(
+    (feature) => distanceOf(feature),
+    (feature) => riskScore(feature, 'shortest'),
+  ))[0]
+  const shortestDist = distanceOf(shortest)
 
-  // D) Long & Scenic: weighted scenic rank under a bounded detour window
-  const scenicCandidates = byDistinctness([
-    ...roadPool.filter((feature) => !isSameRoute(feature, shortest)),
-    ...safePool.filter((feature) => !isSameRoute(feature, shortest)),
-  ])
-  const longScenic = rankScenicCandidate(
-    scenicCandidates,
-    shortestDist,
-    shortest,
-    safest,
-    riskScore,
-    scenicScore,
-  ) || roadPool.filter((feature) => !isSameRoute(feature, shortest))
-    .sort(compareByNumber((feature) => -distanceOf(feature)))[0] || shortest
+  // D) Safest is weighted toward minimum risk, with distance as a small penalty.
+  const safestCandidates = routeCandidates
+  const distinctSafestCandidates = safestCandidates.filter((feature) => !isSameRoute(feature, shortest))
+  const safest = rankSafestCandidate(distinctSafestCandidates, shortestDist, riskScore) || shortest
 
-  // E) Return 3 DISTINCT, CLONED, and LABELED
+  // E) Return Shortest and Safest as distinct labeled choices when possible.
   const out = []
   const pushUnique = (f, label, tag) => {
     if (!f) return
@@ -937,14 +781,11 @@ async function fetchThreeRoutes(o, d) {
 
   pushUnique(shortest, 'Shortest', 'shortest')
   pushUnique(safest,  'Safest',   'safest')
-  pushUnique(longScenic, 'Long & Scenic', 'long')
 
-  // backfill if we somehow got dupes
-  for (const c of [...roadPool, ...safePool]) {
-    if (out.length >= 3) break
-    if (!out.some(x => isSameRoute(x, c))) pushUnique(c, `Route ${out.length+1}`, 'alt')
+  if (out.length < 2) {
+    poolWarning = [poolWarning, 'No distinct safest alternative was available.'].filter(Boolean).join(' ')
   }
-  return { routes: out.slice(0, 3), poolWarning }
+  return { routes: out.slice(0, 2), poolWarning }
 }
 
 
@@ -965,12 +806,12 @@ async function fetchThreeRoutes(o, d) {
       setOriginCoord(o); setDestCoord(d)
       addOrMoveMarker('origin', o); addOrMoveMarker('dest', d)
 
-      const { routes: features, poolWarning: pw } = await fetchThreeRoutes(o, d)
+      const { routes: features, poolWarning: pw } = await fetchDesignatedRoutes(o, d)
       if (!Array.isArray(features) || !features.length) throw new Error('No route found')
       if (pw) setPoolWarning(pw)
 
       riskFCCache.current.clear()
-      setRoutes(features)           // three designated
+      setRoutes(features)           // Shortest and Safest
       setRouteInsightsCache(features.map(f => getInsights(f)))
       setActiveRouteIdx(0)          // select "Shortest" by default
 
@@ -1177,11 +1018,21 @@ async function fetchThreeRoutes(o, d) {
           <button type="button" className="secondary" onClick={() => zoomBy(-1)} title="Zoom out">Zoom −</button>
         </div>
 
-        <div style={{ display:'flex', gap:8, marginTop:8, alignItems:'center' }}>
+        <div style={{ display:'flex', flexDirection:'column', gap:6, marginTop:10 }}>
+          <div style={{fontSize:12, color:'#9fb1c7', fontWeight:600}}>Map details</div>
           <label style={{ display:'inline-flex', gap:8, alignItems:'center', fontSize:14 }}>
-            <input type="checkbox" checked={showCyclePaths} onChange={e => setShowCyclePaths(e.target.checked)} aria-label="Toggle cycle paths overlay" />
+            <input type="checkbox" checked={showCyclePaths} onChange={e => setShowCyclePaths(e.target.checked)} aria-label="Toggle cycle paths overlay" style={{flex:'0 0 auto'}} />
             Show cycle paths overlay
           </label>
+          <label style={{ display:'inline-flex', gap:8, alignItems:'center', fontSize:14 }}>
+            <input type="checkbox" checked={showScenicPlaces} onChange={e => setShowScenicPlaces(e.target.checked)} aria-label="Toggle scenic places overlay" style={{flex:'0 0 auto'}} />
+            Show scenic places
+          </label>
+          {showScenicPlaces && (
+            <div role="status" style={{fontSize:12, color:'#86efac'}}>
+              Highlighting parks, gardens, nature reserves, and protected areas.
+            </div>
+          )}
         </div>
 
         <RouteInsights
@@ -1259,7 +1110,7 @@ async function fetchThreeRoutes(o, d) {
   )
 }
 
-// --- parks overlay (simple)
+// --- scenic places overlay
 const anyVectorSource = (m) => {
   const srcs = m.getStyle()?.sources || {}
   return Object.keys(srcs).find(k => srcs[k].type === 'vector')
@@ -1278,6 +1129,14 @@ const ensureParksOverlay = (m) => {
     id:'parks-icon', type:'symbol', source:src, 'source-layer':layer, filter:parkFilter, minzoom:10,
     layout:{ 'icon-image':'park-icon','icon-size':['interpolate',['linear'],['zoom'],10,0.9,12,1.0,15,1.2],'icon-allow-overlap':true,'icon-ignore-placement':true,'symbol-placement':'point','icon-offset':[0,-2] }
   })
+}
+const setScenicPlacesVisibility = (m, visible) => {
+  const visibility = visible ? 'visible' : 'none'
+  for (const layerId of SCENIC_LAYER_IDS) {
+    if (m.getLayer(layerId) && m.getLayoutProperty(layerId, 'visibility') !== visibility) {
+      m.setLayoutProperty(layerId, 'visibility', visibility)
+    }
+  }
 }
 const makeParkIcon = () => {
   const px=64, c=document.createElement('canvas'); c.width=c.height=px
