@@ -7,7 +7,7 @@ export default defineConfig(({ mode }) => {
   const isCI = process.env.CI === 'true'
 
   return {
-    base: '/', // user site lives at root
+    base: '/BikeSafe/', // project site lives at /BikeSafe/
     plugins: [react()],
     server: {
       proxy: {
