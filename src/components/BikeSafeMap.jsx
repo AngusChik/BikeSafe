@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { VectorTile } from '@mapbox/vector-tile'
 import maplibregl from 'maplibre-gl'
+import Pbf from 'pbf'
 import QRCode from 'qrcode'
 import ShareButtons from './ShareButtons.jsx'
 import GeoAutocomplete from './GeoAutocomplete.jsx'
@@ -18,14 +20,21 @@ const ORS_BASE     = import.meta.env.DEV ? '/ors' : 'https://api.openrouteservic
 const DEFAULT_CENTER = [-79.6440, 43.5890]
 const DEFAULT_ZOOM   = 12
 const SAFETY_DISTANCE_WEIGHT = 0.12
+const SCENIC_SOURCE_ID = 'scenic-route-places'
+const SCENIC_TILE_ZOOM = 14
+const SCENIC_MAX_TILES = 24
+const SCENIC_CLICK_RADIUS = 20
+const SCENIC_ROUTE_RADIUS_METERS = 1400
+const EMPTY_SCENIC_PLACES = { type:'FeatureCollection', features:[] }
 const SCENIC_PIN_GROUPS = [
-  { id:'scenic-nature-pins', label:'Nature & views', shortLabel:'nature', color:'#16a34a', symbol:'N', minzoom:14, maxRank:8, categories:['park','garden','viewpoint','picnic_site'] },
-  { id:'scenic-place-pins', label:'Plazas & sights', shortLabel:'plazas & sights', color:'#8b5cf6', symbol:'P', minzoom:14, maxRank:10, categories:['mall','marketplace','attraction','museum','gallery','artwork','monument','arts_centre'] },
-  { id:'scenic-cafe-pins', label:'Cafés & treats', shortLabel:'cafés', color:'#ea580c', symbol:'C', minzoom:14, maxRank:15, categories:['cafe','bakery','ice_cream'] },
-  { id:'scenic-cyclist-pins', label:'Cyclist essentials', shortLabel:'bike stops', color:'#0284c7', symbol:'B', minzoom:14, categories:['bicycle','bicycle_rental','drinking_water','toilets','shelter'] },
+  { id:'scenic-nature-pins', label:'Nature & views', shortLabel:'nature', color:'#16a34a', symbol:'N', limit:10, maxRank:8, categories:['park','garden','viewpoint','picnic_site'] },
+  { id:'scenic-place-pins', label:'Plazas & sights', shortLabel:'plazas & sights', color:'#8b5cf6', symbol:'P', limit:12, maxRank:10, categories:['mall','marketplace','attraction','museum','gallery','artwork','monument','arts_centre'] },
+  { id:'scenic-cafe-pins', label:'Cafés & treats', shortLabel:'cafés', color:'#ea580c', symbol:'C', limit:14, maxRank:15, categories:['cafe','bakery','ice_cream'] },
+  { id:'scenic-cyclist-pins', label:'Cyclist essentials', shortLabel:'bike stops', color:'#0284c7', symbol:'B', limit:14, categories:['bicycle','bicycle_rental','drinking_water','toilets','shelter'] },
 ]
 const SCENIC_PIN_LAYER_IDS = SCENIC_PIN_GROUPS.map(group => group.id)
 const SCENIC_LAYER_IDS = [...SCENIC_PIN_LAYER_IDS]
+const scenicTileCache = new Map()
 
 const http = async (url, opts = {}, timeout = 20000) => {
   const ctl = new AbortController()
@@ -58,6 +67,7 @@ export default function BikeSafeMap(){
   const qrRef = useRef(null)
   const popupRef = useRef(null)
   const scenicPopupRef = useRef(null)
+  const scenicPlacesDataRef = useRef(EMPTY_SCENIC_PLACES)
 
   const hoveredRidRef = useRef(-1)
   const routeCoordsRef = useRef([])
@@ -88,6 +98,7 @@ export default function BikeSafeMap(){
 
   const [showCyclePaths, setShowCyclePaths] = useState(false)
   const [showScenicPlaces, setShowScenicPlaces] = useState(false)
+  const [scenicPlacesStatus, setScenicPlacesStatus] = useState({ loading:false, count:0, error:null })
   const CYCLE_LAYER_ID = 'cycle-paths-overlay'
   const CYCLE_CASING_ID = 'cycle-paths-overlay-casing'
 
@@ -328,11 +339,11 @@ export default function BikeSafeMap(){
     }
   }, [map, routes, activeRouteIdx])
 
-  // show scenic places only when the user asks for them
+  // keep the scenic layers in sync with the toggle and style reloads
   useEffect(() => {
     if (!map) return
     const syncScenicPlaces = () => {
-      if (showScenicPlaces) ensureScenicPlacesOverlay(map)
+      ensureScenicPlacesOverlay(map, scenicPlacesDataRef.current)
       setScenicPlacesVisibility(map, showScenicPlaces)
       if (!showScenicPlaces) scenicPopupRef.current?.remove()
     }
@@ -342,24 +353,56 @@ export default function BikeSafeMap(){
   }, [map, showScenicPlaces])
 
   useEffect(() => {
+    if (!map || !showScenicPlaces) return
+    const controller = new AbortController()
+    const activeRoute = routes[activeRouteIdx] || null
+    setScenicPlacesStatus(previous => ({ ...previous, loading:true, error:null }))
+
+    fetchScenicPlaces(activeRoute, map, controller.signal)
+      .then(data => {
+        if (controller.signal.aborted) return
+        scenicPlacesDataRef.current = data
+        ensureScenicPlacesOverlay(map, data)
+        map.getSource(SCENIC_SOURCE_ID)?.setData(data)
+        setScenicPlacesVisibility(map, true)
+        setScenicPlacesStatus({ loading:false, count:data.features.length, error:null })
+      })
+      .catch(error => {
+        if (error?.name === 'AbortError') return
+        setScenicPlacesStatus(previous => ({ ...previous, loading:false, error:'Scenic pins are unavailable right now.' }))
+      })
+
+    return () => controller.abort()
+  }, [map, showScenicPlaces, routes, activeRouteIdx])
+
+  useEffect(() => {
     if (!map) return
     const onPinClick = (event) => {
-      const feature = event.features?.find(item => item.properties?.['name:latin'] || item.properties?.name) || event.features?.[0]
-      const group = SCENIC_PIN_GROUPS.find(item => item.id === feature?.layer?.id)
+      const layers = SCENIC_PIN_LAYER_IDS.filter(layerId => map.getLayer(layerId))
+      if (!layers.length) return
+      const { x, y } = event.point
+      const features = map.queryRenderedFeatures([
+        [x - SCENIC_CLICK_RADIUS, y - SCENIC_CLICK_RADIUS],
+        [x + SCENIC_CLICK_RADIUS, y + SCENIC_CLICK_RADIUS],
+      ], { layers })
+      const feature = features.find(item => item.properties?.['name:latin'] || item.properties?.name) || features[0]
+      const groupId = feature?.properties?.scenicGroupId || feature?.layer?.id
+      const group = SCENIC_PIN_GROUPS.find(item => item.id === groupId)
       if (!feature || !group || !scenicPopupRef.current) return
+      const coordinates = feature.geometry?.type === 'Point' ? feature.geometry.coordinates : event.lngLat
       scenicPopupRef.current
-        .setLngLat(event.lngLat)
+        .setLngLat(coordinates)
         .setDOMContent(createScenicPopupContent(feature, group))
         .addTo(map)
     }
     const onPinEnter = () => { map.getCanvas().style.cursor = 'pointer' }
     const onPinLeave = () => { map.getCanvas().style.cursor = '' }
 
-    map.on('click', SCENIC_PIN_LAYER_IDS, onPinClick)
+    map.on('click', onPinClick)
     map.on('mouseenter', SCENIC_PIN_LAYER_IDS, onPinEnter)
     map.on('mouseleave', SCENIC_PIN_LAYER_IDS, onPinLeave)
     return () => {
-      map.off('click', SCENIC_PIN_LAYER_IDS, onPinClick)
+      map.off('click', onPinClick)
       map.off('mouseenter', SCENIC_PIN_LAYER_IDS, onPinEnter)
       map.off('mouseleave', SCENIC_PIN_LAYER_IDS, onPinLeave)
     }
@@ -848,6 +891,7 @@ async function fetchDesignatedRoutes(o, d) {
       setRoutes(features)           // Shortest and Safest
       setRouteInsightsCache(features.map(f => getInsights(f)))
       setActiveRouteIdx(0)          // select "Shortest" by default
+      setShowScenicPlaces(true)     // show useful places as soon as a route is ready
 
       lastRouteRef.current = features[0]
       routeCoordsRef.current = features[0].geometry?.coordinates || []
@@ -1059,16 +1103,16 @@ async function fetchDesignatedRoutes(o, d) {
             Show cycle paths overlay
           </label>
           <label style={{ display:'inline-flex', gap:8, alignItems:'center', fontSize:14 }}>
-            <input type="checkbox" checked={showScenicPlaces} onChange={e => {
-              const visible = e.target.checked
-              setShowScenicPlaces(visible)
-              if (visible && map?.getZoom() < 14) map.easeTo({zoom:14, duration:700})
-            }} aria-label="Toggle scenic places overlay" style={{flex:'0 0 auto'}} />
+            <input type="checkbox" checked={showScenicPlaces} onChange={e => setShowScenicPlaces(e.target.checked)} aria-label="Toggle scenic places overlay" style={{flex:'0 0 auto'}} />
             Show scenic places
           </label>
           {showScenicPlaces && (
             <div role="status" style={{fontSize:12, color:'#b7c7dc'}}>
-              <div style={{color:'#86efac', marginBottom:4}}>Highlighting parks and cyclist-friendly places.</div>
+              <div style={{color:scenicPlacesStatus.error ? '#fca5a5' : '#86efac', marginBottom:4}}>
+                {scenicPlacesStatus.loading
+                  ? 'Finding cyclist-friendly places…'
+                  : scenicPlacesStatus.error || `Showing ${scenicPlacesStatus.count} places ${routes.length ? 'near this route' : 'nearby'}.`}
+              </div>
               <div style={{display:'flex', flexWrap:'wrap', gap:'4px 10px'}}>
                 {SCENIC_PIN_GROUPS.map(group => (
                   <span key={group.id} style={{display:'inline-flex', alignItems:'center', gap:4}}>
@@ -1157,41 +1201,26 @@ async function fetchDesignatedRoutes(o, d) {
 }
 
 // --- scenic places overlay
-const anyVectorSource = (m) => {
-  const srcs = m.getStyle()?.sources || {}
-  return Object.keys(srcs).find(k => srcs[k].type === 'vector')
-}
-const ensureScenicPlacesOverlay = (m) => {
-  const style = m.getStyle() || {}
-  const layers = style.layers || []
-  const poiLayer = layers.find(item => item['source-layer'] === 'poi')
-  const src = poiLayer?.source || anyVectorSource(m); if (!src) return
+const ensureScenicPlacesOverlay = (m, data = EMPTY_SCENIC_PLACES) => {
+  if (!m.getSource(SCENIC_SOURCE_ID)) {
+    m.addSource(SCENIC_SOURCE_ID, { type:'geojson', data })
+  }
 
   for (const group of SCENIC_PIN_GROUPS) {
     if (m.getLayer(group.id)) continue
-    const filter = [
-      'all',
-      ['==',['geometry-type'],'Point'],
-      ['any',
-        ['in',['get','class'],['literal',group.categories]],
-        ['in',['get','subclass'],['literal',group.categories]],
-      ],
-      ...(group.maxRank ? [['<=',['get','rank'],group.maxRank]] : []),
-    ]
     m.addLayer({
       id:group.id,
       type:'circle',
-      source:src,
-      'source-layer':'poi',
-      minzoom:group.minzoom,
-      filter,
+      source:SCENIC_SOURCE_ID,
+      minzoom:8,
+      filter:['==',['get','scenicGroupId'],group.id],
       layout:{ 'circle-sort-key':['coalesce',['get','rank'],999] },
       paint:{
-        'circle-radius':['interpolate',['linear'],['zoom'],11,5,14,7,16,9],
+        'circle-radius':['interpolate',['linear'],['zoom'],8,7,11,9,14,11,16,13],
         'circle-color':group.color,
         'circle-opacity':0.96,
         'circle-stroke-color':'#ffffff',
-        'circle-stroke-width':2,
+        'circle-stroke-width':3,
       },
     })
   }
@@ -1203,6 +1232,139 @@ const setScenicPlacesVisibility = (m, visible) => {
       m.setLayoutProperty(layerId, 'visibility', visibility)
     }
   }
+}
+const lineCoordinates = (feature) => {
+  const geometry = feature?.geometry
+  if (!geometry) return []
+  if (geometry.type === 'LineString') return geometry.coordinates || []
+  if (geometry.type === 'MultiLineString') return (geometry.coordinates || []).flat()
+  if (geometry.type === 'GeometryCollection') {
+    return (geometry.geometries || []).flatMap(item => lineCoordinates({ geometry:item }))
+  }
+  return []
+}
+const sampleCoordinates = (coordinates, limit) => {
+  if (coordinates.length <= limit) return coordinates
+  return Array.from({ length:limit }, (_, index) => coordinates[Math.round(index * (coordinates.length - 1) / (limit - 1))])
+}
+const lngLatToTile = ([lng, lat], zoom = SCENIC_TILE_ZOOM) => {
+  const scale = 2 ** zoom
+  const xFloat = ((lng + 180) / 360) * scale
+  const latitude = Math.max(-85.0511, Math.min(85.0511, lat)) * Math.PI / 180
+  const yFloat = ((1 - Math.asinh(Math.tan(latitude)) / Math.PI) / 2) * scale
+  return { x:Math.floor(xFloat), y:Math.floor(yFloat), xFraction:xFloat % 1, yFraction:yFloat % 1, zoom }
+}
+const addScenicTile = (tiles, x, y, zoom = SCENIC_TILE_ZOOM) => {
+  const scale = 2 ** zoom
+  if (y < 0 || y >= scale) return
+  const wrappedX = ((x % scale) + scale) % scale
+  tiles.set(`${zoom}/${wrappedX}/${y}`, { x:wrappedX, y, zoom })
+}
+const scenicTilesFor = (feature, m) => {
+  const coordinates = lineCoordinates(feature)
+  const tiles = new Map()
+
+  if (!coordinates.length) {
+    const center = m.getCenter()
+    const tile = lngLatToTile([center.lng, center.lat])
+    for (let xOffset = -1; xOffset <= 1; xOffset++) {
+      for (let yOffset = -1; yOffset <= 1; yOffset++) addScenicTile(tiles, tile.x + xOffset, tile.y + yOffset)
+    }
+    return [...tiles.values()]
+  }
+
+  for (const coordinate of sampleCoordinates(coordinates, 600)) {
+    const tile = lngLatToTile(coordinate)
+    const xOffsets = [0]
+    const yOffsets = [0]
+    if (tile.xFraction < 0.2) xOffsets.push(-1)
+    if (tile.xFraction > 0.8) xOffsets.push(1)
+    if (tile.yFraction < 0.2) yOffsets.push(-1)
+    if (tile.yFraction > 0.8) yOffsets.push(1)
+    for (const xOffset of xOffsets) {
+      for (const yOffset of yOffsets) addScenicTile(tiles, tile.x + xOffset, tile.y + yOffset)
+    }
+  }
+
+  const ordered = [...tiles.values()]
+  if (ordered.length <= SCENIC_MAX_TILES) return ordered
+  return Array.from({ length:SCENIC_MAX_TILES }, (_, index) => ordered[Math.round(index * (ordered.length - 1) / (SCENIC_MAX_TILES - 1))])
+}
+const scenicGroupFor = (properties) => {
+  const categories = [properties?.class, properties?.subclass]
+  return SCENIC_PIN_GROUPS.find(group => categories.some(category => group.categories.includes(category)))
+}
+const fetchScenicTile = async ({ x, y, zoom }, signal) => {
+  const cacheKey = `${zoom}/${x}/${y}`
+  if (scenicTileCache.has(cacheKey)) return scenicTileCache.get(cacheKey)
+  const response = await fetch(`https://api.maptiler.com/tiles/v3/${zoom}/${x}/${y}.pbf?key=${MAPTILER_KEY}`, { signal })
+  if (!response.ok) throw new Error(`Scenic tile request failed (${response.status})`)
+  const vectorTile = new VectorTile(new Pbf(new Uint8Array(await response.arrayBuffer())))
+  const poiLayer = vectorTile.layers.poi
+  const features = []
+
+  if (poiLayer) {
+    for (let index = 0; index < poiLayer.length; index++) {
+      const tileFeature = poiLayer.feature(index)
+      const properties = tileFeature.properties || {}
+      const group = scenicGroupFor(properties)
+      const rank = Number(properties.rank)
+      if (!group || (group.maxRank && Number.isFinite(rank) && rank > group.maxRank)) continue
+      const feature = tileFeature.toGeoJSON(x, y, zoom)
+      if (feature.geometry?.type !== 'Point') continue
+      feature.properties = { ...properties, scenicGroupId:group.id }
+      features.push(feature)
+    }
+  }
+
+  scenicTileCache.set(cacheKey, features)
+  return features
+}
+const distanceToCoordinates = (coordinate, coordinates) => coordinates.reduce((closest, [lng, lat]) => {
+  const distance = haversineMeters({ lng:coordinate[0], lat:coordinate[1] }, { lng, lat })
+  return Math.min(closest, distance)
+}, Infinity)
+const fetchScenicPlaces = async (feature, m, signal) => {
+  const routeCoordinates = lineCoordinates(feature)
+  const center = m.getCenter()
+  const distanceCoordinates = routeCoordinates.length
+    ? sampleCoordinates(routeCoordinates, 80)
+    : [[center.lng, center.lat]]
+  const tileResults = await Promise.allSettled(scenicTilesFor(feature, m).map(tile => fetchScenicTile(tile, signal)))
+  if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+  const successfulResults = tileResults.filter(result => result.status === 'fulfilled')
+  if (!successfulResults.length) throw tileResults.find(result => result.status === 'rejected')?.reason || new Error('No scenic tiles loaded')
+
+  const uniqueFeatures = new Map()
+  for (const result of successfulResults) {
+    for (const item of result.value) {
+      const coordinate = item.geometry.coordinates
+      const distance = distanceToCoordinates(coordinate, distanceCoordinates)
+      if (routeCoordinates.length && distance > SCENIC_ROUTE_RADIUS_METERS) continue
+      const properties = item.properties || {}
+      const key = `${properties.name || ''}|${properties.class || ''}|${properties.subclass || ''}|${coordinate[0].toFixed(5)}|${coordinate[1].toFixed(5)}`
+      if (!uniqueFeatures.has(key)) {
+        uniqueFeatures.set(key, { ...item, properties:{ ...properties, scenicDistance:Math.round(distance) } })
+      }
+    }
+  }
+
+  const selected = []
+  for (const group of SCENIC_PIN_GROUPS) {
+    const matches = [...uniqueFeatures.values()]
+      .filter(item => item.properties.scenicGroupId === group.id)
+      .sort((left, right) => {
+        const leftNamed = left.properties['name:latin'] || left.properties.name
+        const rightNamed = right.properties['name:latin'] || right.properties.name
+        const leftScore = left.properties.scenicDistance + (leftNamed ? 0 : 350) + (Number(left.properties.rank) || 20) * 15
+        const rightScore = right.properties.scenicDistance + (rightNamed ? 0 : 350) + (Number(right.properties.rank) || 20) * 15
+        return leftScore - rightScore
+      })
+      .slice(0, group.limit)
+    selected.push(...matches)
+  }
+
+  return { type:'FeatureCollection', features:selected }
 }
 const createScenicPopupContent = (feature, group) => {
   const properties = feature.properties || {}
