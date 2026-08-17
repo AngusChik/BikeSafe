@@ -17,6 +17,13 @@ const ORS_BASE     = import.meta.env.DEV ? '/ors' : 'https://api.openrouteservic
 
 const DEFAULT_CENTER = [-79.6440, 43.5890]
 const DEFAULT_ZOOM   = 12
+const SAFETY_DISTANCE_WEIGHT = 0.12
+const SCENIC_SCORE_WEIGHT = 0.58
+const SCENIC_DISTANCE_WEIGHT = 0.27
+const SCENIC_SAFETY_WEIGHT = 0.15
+const SCENIC_MIN_DETOUR = 1.12
+const SCENIC_TARGET_DETOUR = 1.32
+const SCENIC_MAX_DETOUR = 1.75
 
 const http = async (url, opts = {}, timeout = 20000) => {
   const ctl = new AbortController()
@@ -87,12 +94,11 @@ export default function BikeSafeMap(){
   const [routes, setRoutes] = useState([])   // exactly 3 designated routes
   const [routeInsightsCache, setRouteInsightsCache] = useState([]) // cached getInsights per route
   const [activeRouteIdx, setActiveRouteIdx] = useState(0)
-  const activeRoute = routes[activeRouteIdx] || null
   const riskFCCache = useRef(new Map())  // cache toRiskFC results keyed by routeSig
 
   // --- risk overlay housekeeping
-  const safeRemoveLayer  = (m, id) => { try { if (m.getLayer(id))  m.removeLayer(id) } catch {} }
-  const safeRemoveSource = (m, id) => { try { if (m.getSource(id)) m.removeSource(id) } catch {} }
+  const safeRemoveLayer  = (m, id) => { try { if (m.getLayer(id))  m.removeLayer(id) } catch { return } }
+  const safeRemoveSource = (m, id) => { try { if (m.getSource(id)) m.removeSource(id) } catch { return } }
   const clearRiskOverlay = (m) => {
     safeRemoveLayer(m, 'route-risk-hover')
     safeRemoveLayer(m, 'route-risk-line')
@@ -126,7 +132,7 @@ export default function BikeSafeMap(){
         m.on('error', (e) => setErr(e?.error?.message || 'Map error — check MapTiler key.'))
       }catch{ setErr('Failed to init map. Check keys/network.') }
     })()
-    return () => { cancelled = true; try{ m && m.remove() }catch{} }
+    return () => { cancelled = true; try{ m && m.remove() }catch{ return } }
   }, [])
 
   // bias search to viewport
@@ -366,7 +372,7 @@ useEffect(() => {
   }, [map])
 
   // geolocation
-  const useMyLocation = (which) => {
+  const applyMyLocation = (which) => {
     if (!navigator.geolocation) { setErr('Geolocation not supported'); return }
     navigator.geolocation.getCurrentPosition(
       (pos) => {
@@ -456,8 +462,8 @@ useEffect(() => {
 
   function removeCyclePathsLayer(){
     if (!map) return
-    try { if (map.getLayer(CYCLE_LAYER_ID))  map.removeLayer(CYCLE_LAYER_ID) } catch {}
-    try { if (map.getLayer(CYCLE_CASING_ID)) map.removeLayer(CYCLE_CASING_ID) } catch {}
+    try { if (map.getLayer(CYCLE_LAYER_ID))  map.removeLayer(CYCLE_LAYER_ID) } catch { return }
+    try { if (map.getLayer(CYCLE_CASING_ID)) map.removeLayer(CYCLE_CASING_ID) } catch { return }
   }
 
   // toggle overlay
@@ -765,19 +771,124 @@ const envBonusNear = (m, coords, pxRadius = 28) => {
   }
 }
 
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
+
+const normalizedValue = (value, min, max) => {
+  if (!Number.isFinite(value)) return 0
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return 0.5
+  return clamp((value - min) / (max - min), 0, 1)
+}
+
+const scoreDistanceFit = (detourFactor, targetFactor = SCENIC_TARGET_DETOUR, maxFactor = SCENIC_MAX_DETOUR) => {
+  if (!Number.isFinite(detourFactor) || detourFactor < 1 || detourFactor > maxFactor) return 0
+  if (detourFactor < SCENIC_MIN_DETOUR) {
+    return clamp((detourFactor - 1) / Math.max(0.001, SCENIC_MIN_DETOUR - 1), 0, 1) * 0.7
+  }
+  const span = Math.max(0.001, maxFactor - SCENIC_MIN_DETOUR)
+  const distanceFromTarget = Math.abs(detourFactor - targetFactor)
+  return 1 - clamp(distanceFromTarget / span, 0, 1)
+}
+
+const compareByNumber = (...getters) => (left, right) => {
+  for (const getter of getters) {
+    const diff = getter(left) - getter(right)
+    if (diff !== 0) return diff
+  }
+  return 0
+}
+
+const rankSafestCandidate = (candidates, shortestDist, scoreRisk) => {
+  if (!candidates.length) return null
+  const metrics = candidates.map((feature) => {
+    const distance = distanceOf(feature)
+    const detourFactor = shortestDist > 0 ? distance / shortestDist : 1
+    const safety = scoreRisk(feature, 'safest')
+    return {
+      feature,
+      distance,
+      safety,
+      weightedScore: safety + Math.max(0, detourFactor - 1) * SAFETY_DISTANCE_WEIGHT,
+    }
+  })
+
+  return metrics.sort(compareByNumber(
+    (item) => item.weightedScore,
+    (item) => item.safety,
+    (item) => item.distance,
+  ))[0]?.feature ?? null
+}
+
+const rankScenicCandidate = (candidates, shortestDist, shortestRoute, safestRoute, scoreRisk, scoreScenic) => {
+  if (!candidates.length) return null
+
+  const metrics = candidates
+    .map((feature) => {
+      const distance = distanceOf(feature)
+      const detourFactor = shortestDist > 0 ? distance / shortestDist : 1
+      const scenic = scoreScenic(feature)
+      const safety = scoreRisk(feature, 'scenic')
+      const overlapPenalty = Math.max(
+        routeOverlap(feature, shortestRoute),
+        routeOverlap(feature, safestRoute),
+      )
+
+      return {
+        feature,
+        distance,
+        detourFactor,
+        scenic,
+        safety,
+        overlapPenalty,
+        distanceFit: scoreDistanceFit(detourFactor),
+      }
+    })
+    .filter((item) => item.scenic != null && item.detourFactor <= SCENIC_MAX_DETOUR)
+
+  if (!metrics.length) return null
+
+  const scenicValues = metrics.map((item) => item.scenic)
+  const safetyValues = metrics.map((item) => item.safety)
+  const scenicMin = Math.min(...scenicValues)
+  const scenicMax = Math.max(...scenicValues)
+  const safetyMin = Math.min(...safetyValues)
+  const safetyMax = Math.max(...safetyValues)
+
+  return metrics
+    .map((item) => {
+      const scenicNorm = normalizedValue(item.scenic, scenicMin, scenicMax)
+      const safetyNorm = 1 - normalizedValue(item.safety, safetyMin, safetyMax)
+      const overlapPenalty = clamp(item.overlapPenalty, 0, 1) * 0.2
+
+      return {
+        ...item,
+        weightedScore:
+          scenicNorm * SCENIC_SCORE_WEIGHT +
+          item.distanceFit * SCENIC_DISTANCE_WEIGHT +
+          safetyNorm * SCENIC_SAFETY_WEIGHT -
+          overlapPenalty,
+      }
+    })
+    .sort(compareByNumber(
+      (item) => -item.weightedScore,
+      (item) => item.overlapPenalty,
+      (item) => item.safety,
+      (item) => -item.distance,
+    ))[0]?.feature ?? null
+}
+
 
 
 async function fetchThreeRoutes(o, d) {
-  // A) Shortest pool — pick safest within 5% of minimum distance
+  // A) Shortest — exact shortest path, with safety only as a strict tie-break
   const shortestList = await fetchORSWithAlts(o, d, { profile:'cycling-road', preference:'shortest', altCount:3 })
   if (!shortestList.length) throw new Error('No route (shortest)')
-  const sortedByDist = [...shortestList].sort((a,b) => distanceOf(a) - distanceOf(b))
-  const minDist = distanceOf(sortedByDist[0])
-  const nearShortest = sortedByDist.filter(f => distanceOf(f) <= minDist * 1.05)
-  const shortest = nearShortest.sort((a,b) => riskScore(a, 'shortest') - riskScore(b, 'shortest'))[0]
+  const shortest = [...shortestList].sort(compareByNumber(
+    (feature) => distanceOf(feature),
+    (feature) => riskScore(feature, 'shortest'),
+  ))[0]
   const shortestDist = distanceOf(shortest)
 
-  // B) Pools (fetch in parallel — these are independent)
+  // B) Pools for weighted re-ranking
   let poolWarning = null
   const results = await Promise.allSettled([
     fetchORSWithAlts(o, d, { profile:'cycling-road',    preference:'recommended', altCount:8, weightFactor:3.0, shareFactor:0.4 }),
@@ -794,45 +905,24 @@ async function fetchThreeRoutes(o, d) {
   const roadPool = byDistinctness([...roadAlts1, ...roadAlts2])
   const safePool = byDistinctness(safeAlts)
 
-  // C) Safest: cross-pool, score with 'safest' routeType, enforce diversity vs shortest
-  const allForSafety = byDistinctness([...safePool, ...roadPool])
-  const safetySorted = allForSafety.length
-    ? [...allForSafety].sort((a,b) => riskScore(a, 'safest') - riskScore(b, 'safest'))
-    : [shortest]
-  let safest = safetySorted[0]
-  if (routeOverlap(safest, shortest) > 0.8) {
-    const diverse = safetySorted.find(f => !isSameRoute(f, safest) && routeOverlap(f, shortest) <= 0.8)
-    if (diverse) safest = diverse
-  }
+  // C) Safest: weighted toward minimum risk, with distance as a small penalty
+  const safestCandidates = byDistinctness([...shortestList, ...safePool, ...roadPool])
+  const safest = rankSafestCandidate(safestCandidates, shortestDist, riskScore) || shortest
 
-  // D) Long & Scenic: infra-aware scenic scoring, prefer longer if close
-  const scenicCandidates = roadPool
-    .filter(f => !isSameRoute(f, shortest) && !isSameRoute(f, safest))
-    .map(f => ({ f, s: scenicScore(f), d: distanceOf(f) }))
-    .filter(x => x.s != null)
-    .sort((A,B) => (B.s - A.s) || (B.d - A.d))
-
-  let best = scenicCandidates[0]?.f ?? null
-
-  if (best) {
-    const bestScore = scenicScore(best)
-    const longFactor = Math.max(1.1, 1 + 0.5 / Math.log10(Math.max(2, shortestDist / 1000)))
-    const minLong = shortestDist * longFactor
-    const nearBestLong = scenicCandidates
-      .filter(X => X.d >= minLong && X.s >= bestScore - 0.4)
-      .sort((A,B) => (B.s - A.s) || (B.d - A.d))[0]
-    if (nearBestLong) best = nearBestLong.f
-  }
-
-  // Diversity check: scenic should differ from both shortest and safest
-  if (best && (routeOverlap(best, shortest) > 0.7 || routeOverlap(best, safest) > 0.7)) {
-    const diverse = scenicCandidates.find(x =>
-      !isSameRoute(x.f, best) && routeOverlap(x.f, shortest) <= 0.7 && routeOverlap(x.f, safest) <= 0.7)
-    if (diverse) best = diverse.f
-  }
-
-  const longScenic = best || roadPool.filter(f => !isSameRoute(f, shortest) && !isSameRoute(f, safest))
-    .sort((a,b)=>distanceOf(b)-distanceOf(a))[0] || shortest
+  // D) Long & Scenic: weighted scenic rank under a bounded detour window
+  const scenicCandidates = byDistinctness([
+    ...roadPool.filter((feature) => !isSameRoute(feature, shortest)),
+    ...safePool.filter((feature) => !isSameRoute(feature, shortest)),
+  ])
+  const longScenic = rankScenicCandidate(
+    scenicCandidates,
+    shortestDist,
+    shortest,
+    safest,
+    riskScore,
+    scenicScore,
+  ) || roadPool.filter((feature) => !isSameRoute(feature, shortest))
+    .sort(compareByNumber((feature) => -distanceOf(feature)))[0] || shortest
 
   // E) Return 3 DISTINCT, CLONED, and LABELED
   const out = []
@@ -967,21 +1057,10 @@ async function fetchThreeRoutes(o, d) {
       const [lng,lat] = coords[i] || []
       ensureRouteCursor(); updateRouteCursor(lng, lat)
       map.easeTo({ center:[lng,lat], zoom:Math.max(map.getZoom(),15), duration:350 })
-    }catch{}
+    }catch{ return }
   }
 
   const fmtDist = (m) => (m < 950 ? `${Math.round(m)} m` : `${(m/1000).toFixed(1)} km`)
-  const putGeoJSON = (sourceId, data, layer) => {
-    if(!map) return
-    if(map.getSource(sourceId)) map.getSource(sourceId).setData(data)
-    else map.addSource(sourceId, { type:'geojson', data })
-    const id = layer.id
-    if(!map.getLayer(id)) map.addLayer(layer)
-    else{
-      if (layer.paint)  for (const k in layer.paint)  map.setPaintProperty(id, k, layer.paint[k])
-      if (layer.layout) for (const k in layer.layout) map.setLayoutProperty(id, k, layer.layout[k])
-    }
-  }
 
   const selectRoute = (idx, feature) => {
     setActiveRouteIdx(idx)
@@ -1011,7 +1090,7 @@ async function fetchThreeRoutes(o, d) {
               onSelect={({center,label})=>{
                 const c={lng:center[0],lat:center[1]}
                 setOriginCoord(c); setOriginText(label); addOrMoveMarker('origin', c)
-                try{ document.activeElement?.blur?.() }catch{}
+                document.activeElement?.blur?.()
               }}
               placeholder="Enter origin"
               onFocus={()=>{ setActivePicker('origin'); setInsights(null) }}
@@ -1019,7 +1098,7 @@ async function fetchThreeRoutes(o, d) {
               biasBBox={biasBBox}
             />
             <div draggable onDragStart={(e)=>onDragStartPin(e,'origin')} title="Drag this pin onto the map to set Start" aria-grabbed="false" style={{...dragPinStyle, color:'#22c55e'}}>📍</div>
-            <button type="button" onClick={()=>useMyLocation('origin')}>Use my location</button>
+            <button type="button" onClick={()=>applyMyLocation('origin')}>Use my location</button>
           </div>
         </label>
 
@@ -1033,7 +1112,7 @@ async function fetchThreeRoutes(o, d) {
               onSelect={({center,label})=>{
                 const c={lng:center[0],lat:center[1]}
                 setDestCoord(c); setDestText(label); addOrMoveMarker('dest', c)
-                try{ document.activeElement?.blur?.() }catch{}
+                document.activeElement?.blur?.()
               }}
               placeholder="Enter destination"
               onFocus={()=>{ setActivePicker('destination'); setInsights(null) }}
@@ -1041,7 +1120,7 @@ async function fetchThreeRoutes(o, d) {
               biasBBox={biasBBox}
             />
             <div draggable onDragStart={(e)=>onDragStartPin(e,'dest')} title="Drag this pin onto the map to set Destination" aria-grabbed="false" style={{...dragPinStyle, color:'#ef4444'}}>📍</div>
-            <button type="button" onClick={()=>useMyLocation('destination')}>Use my location</button>
+            <button type="button" onClick={()=>applyMyLocation('destination')}>Use my location</button>
           </div>
         </label>
 
@@ -1120,6 +1199,12 @@ async function fetchThreeRoutes(o, d) {
             <span title="High risk"><i style={{display:'inline-block',width:10,height:10,background:'#ef4444',borderRadius:3,marginRight:4}} aria-hidden="true"/>high (avoid)</span>
           </div>
         </div>
+
+        {riskMix && (
+          <div style={{marginTop:8, fontSize:12, color:'#9fb1c7'}}>
+            {`Risk mix: ${riskMix.pctLow}% low • ${riskMix.pctMed}% med • ${riskMix.pctHigh}% high`}
+          </div>
+        )}
 
         {!!directions.length && (
           <div className="directions-card" style={{marginTop:12, padding:12, borderRadius:8, background:'#0b1220', color:'#e6efff', border:'1px solid #1f2a40'}}>

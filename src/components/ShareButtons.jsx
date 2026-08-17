@@ -18,7 +18,7 @@ export default function ShareButtons({ url }){
       const ta = document.createElement('textarea')
       ta.value = url; ta.style.position = 'fixed'; ta.style.opacity = '0'
       document.body.appendChild(ta); ta.select()
-      try { document.execCommand('copy'); setCopied(true); setTimeout(() => setCopied(false), 2000) } catch {}
+      try { document.execCommand('copy'); setCopied(true); setTimeout(() => setCopied(false), 2000) } catch { return }
       document.body.removeChild(ta)
     }
   }
