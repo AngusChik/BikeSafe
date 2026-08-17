@@ -68,6 +68,7 @@ export default function BikeSafeMap(){
   const panelRef = useRef(null)
   const qrRef = useRef(null)
   const popupRef = useRef(null)
+  const scenicHoverPopupRef = useRef(null)
   const scenicPopupRef = useRef(null)
   const scenicPlacesDataRef = useRef(EMPTY_SCENIC_PLACES)
 
@@ -145,7 +146,8 @@ export default function BikeSafeMap(){
           setMap(m)
           setMapReady(true)
           popupRef.current = new maplibregl.Popup({ closeButton:false, closeOnClick:false, offset:8, maxWidth:'280px' })
-          scenicPopupRef.current = new maplibregl.Popup({ closeButton:true, closeOnClick:true, offset:18, maxWidth:'260px' })
+          scenicHoverPopupRef.current = new maplibregl.Popup({ closeButton:false, closeOnClick:false, offset:18, maxWidth:'260px' })
+          scenicPopupRef.current = new maplibregl.Popup({ closeButton:true, closeOnClick:false, offset:18, maxWidth:'260px' })
         })
         m.on('error', (e) => setErr(e?.error?.message || 'Map error — check MapTiler key.'))
       }catch{ setErr('Failed to init map. Check keys/network.') }
@@ -373,7 +375,10 @@ export default function BikeSafeMap(){
     const syncScenicPlaces = () => {
       ensureScenicPlacesOverlay(map, scenicPlacesDataRef.current)
       setScenicPlacesVisibility(map, showScenicPlaces)
-      if (!showScenicPlaces) scenicPopupRef.current?.remove()
+      if (!showScenicPlaces) {
+        scenicHoverPopupRef.current?.remove()
+        scenicPopupRef.current?.remove()
+      }
     }
     syncScenicPlaces()
     map.on('styledata', syncScenicPlaces)
@@ -405,6 +410,19 @@ export default function BikeSafeMap(){
 
   useEffect(() => {
     if (!map) return
+    const featureDetails = (features = []) => {
+      const feature = features.find(item => item.properties?.['name:latin'] || item.properties?.name) || features[0]
+      const groupId = feature?.properties?.scenicGroupId || feature?.layer?.id
+      return { feature, group:SCENIC_PIN_GROUPS.find(item => item.id === groupId) }
+    }
+    const showPopup = (popup, feature, group, fallbackLngLat) => {
+      if (!popup || !feature || !group) return
+      const coordinates = feature.geometry?.type === 'Point' ? feature.geometry.coordinates : fallbackLngLat
+      popup
+        .setLngLat(coordinates)
+        .setDOMContent(createScenicPopupContent(feature, group))
+        .addTo(map)
+    }
     const onPinClick = (event) => {
       const layers = SCENIC_PIN_LAYER_IDS.filter(layerId => map.getLayer(layerId))
       if (!layers.length) return
@@ -413,25 +431,28 @@ export default function BikeSafeMap(){
         [x - SCENIC_CLICK_RADIUS, y - SCENIC_CLICK_RADIUS],
         [x + SCENIC_CLICK_RADIUS, y + SCENIC_CLICK_RADIUS],
       ], { layers })
-      const feature = features.find(item => item.properties?.['name:latin'] || item.properties?.name) || features[0]
-      const groupId = feature?.properties?.scenicGroupId || feature?.layer?.id
-      const group = SCENIC_PIN_GROUPS.find(item => item.id === groupId)
-      if (!feature || !group || !scenicPopupRef.current) return
-      const coordinates = feature.geometry?.type === 'Point' ? feature.geometry.coordinates : event.lngLat
-      scenicPopupRef.current
-        .setLngLat(coordinates)
-        .setDOMContent(createScenicPopupContent(feature, group))
-        .addTo(map)
+      const { feature, group } = featureDetails(features)
+      if (!feature || !group) return
+      scenicHoverPopupRef.current?.remove()
+      showPopup(scenicPopupRef.current, feature, group, event.lngLat)
     }
-    const onPinEnter = () => { map.getCanvas().style.cursor = 'pointer' }
-    const onPinLeave = () => { map.getCanvas().style.cursor = '' }
+    const onPinMove = (event) => {
+      map.getCanvas().style.cursor = 'pointer'
+      if (scenicPopupRef.current?.isOpen()) return
+      const { feature, group } = featureDetails(event.features)
+      showPopup(scenicHoverPopupRef.current, feature, group, event.lngLat)
+    }
+    const onPinLeave = () => {
+      map.getCanvas().style.cursor = ''
+      scenicHoverPopupRef.current?.remove()
+    }
 
     map.on('click', onPinClick)
-    map.on('mouseenter', SCENIC_PIN_LAYER_IDS, onPinEnter)
+    map.on('mousemove', SCENIC_PIN_LAYER_IDS, onPinMove)
     map.on('mouseleave', SCENIC_PIN_LAYER_IDS, onPinLeave)
     return () => {
       map.off('click', onPinClick)
-      map.off('mouseenter', SCENIC_PIN_LAYER_IDS, onPinEnter)
+      map.off('mousemove', SCENIC_PIN_LAYER_IDS, onPinMove)
       map.off('mouseleave', SCENIC_PIN_LAYER_IDS, onPinLeave)
     }
   }, [map])
