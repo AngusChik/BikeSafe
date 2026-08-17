@@ -20,6 +20,7 @@ const ORS_BASE     = import.meta.env.DEV ? '/ors' : 'https://api.openrouteservic
 const DEFAULT_CENTER = [-79.6440, 43.5890]
 const DEFAULT_ZOOM   = 12
 const SAFETY_DISTANCE_WEIGHT = 0.12
+const ROUTE_DIRECTION_ICON_ID = 'route-direction-arrow'
 const SCENIC_SOURCE_ID = 'scenic-route-places'
 const SCENIC_TILE_ZOOM = 14
 const SCENIC_MAX_TILES = 24
@@ -115,6 +116,7 @@ export default function BikeSafeMap(){
   const safeRemoveLayer  = (m, id) => { try { if (m.getLayer(id))  m.removeLayer(id) } catch { return } }
   const safeRemoveSource = (m, id) => { try { if (m.getSource(id)) m.removeSource(id) } catch { return } }
   const clearRiskOverlay = (m) => {
+    safeRemoveLayer(m, 'route-direction-arrows')
     safeRemoveLayer(m, 'route-risk-hover')
     safeRemoveLayer(m, 'route-risk-line')
     safeRemoveSource(m, 'route-risk')
@@ -274,6 +276,31 @@ export default function BikeSafeMap(){
           id:'route-risk-hover', type:'line', source:'route-risk',
           paint:{ 'line-width':14, 'line-color':'#ffffff', 'line-opacity':0.25 },
           filter:['==',['get','rid'],-1]
+        })
+
+        if (!map.hasImage(ROUTE_DIRECTION_ICON_ID)) {
+          map.addImage(ROUTE_DIRECTION_ICON_ID, makeRouteDirectionIcon(), { pixelRatio:2 })
+        }
+        map.addLayer({
+          id:'route-direction-arrows',
+          type:'symbol',
+          source:'route-risk',
+          filter:['all',
+            ['!=',['get','way'],4],
+            ['!=',['get','way'],6],
+            ['!=',['get','infraType'],'separated_path'],
+          ],
+          layout:{
+            'symbol-placement':'line',
+            'symbol-spacing':160,
+            'icon-image':ROUTE_DIRECTION_ICON_ID,
+            'icon-size':['interpolate',['linear'],['zoom'],10,0.85,14,1.05,17,1.2],
+            'icon-rotation-alignment':'map',
+            'icon-pitch-alignment':'map',
+            'icon-keep-upright':false,
+            'icon-allow-overlap':true,
+            'icon-ignore-placement':true,
+          },
         })
         hoveredRidRef.current = -1
       }
@@ -772,8 +799,8 @@ async function fetchORSWithAlts(o, d, {
   }
 
   const json = await orsPost(body, profile)
-  const feats = (json?.features || []).map(f => {
-    f.properties = { ...(f.properties||{}), _preference: preference, _profile: profile }
+  const feats = (json?.features || []).filter(feature => routeRunsStartToDestination(feature, o, d)).map(f => {
+    f.properties = { ...(f.properties||{}), _preference: preference, _profile: profile, _directionChecked:true }
     return f
   })
   return feats
@@ -1087,6 +1114,10 @@ async function fetchDesignatedRoutes(o, d) {
                 )
               })}
             </div>
+            <div role="note" style={{marginTop:8, fontSize:12, color:'#9fb1c7'}}>
+              <span aria-hidden="true" style={{color:'#60a5fa', fontWeight:800, marginRight:5}}>➤</span>
+              Road arrows show travel direction. Dedicated bike paths may run both ways.
+            </div>
           </div>
         )}
 
@@ -1198,6 +1229,48 @@ async function fetchDesignatedRoutes(o, d) {
       </div>
     </div>
   )
+}
+
+const routeRunsStartToDestination = (feature, origin, destination) => {
+  const coordinates = feature?.geometry?.coordinates || []
+  if (!coordinates.length) return false
+  const first = coordinates[0]
+  const last = coordinates[coordinates.length - 1]
+  if (!Array.isArray(first) || !Array.isArray(last)) return false
+  const forwardDistance = haversineMeters(origin, { lng:first[0], lat:first[1] })
+    + haversineMeters(destination, { lng:last[0], lat:last[1] })
+  const reverseDistance = haversineMeters(origin, { lng:last[0], lat:last[1] })
+    + haversineMeters(destination, { lng:first[0], lat:first[1] })
+  return forwardDistance <= reverseDistance
+}
+const makeRouteDirectionIcon = () => {
+  const size = 48
+  const canvas = document.createElement('canvas')
+  canvas.width = canvas.height = size
+  const context = canvas.getContext('2d')
+  context.fillStyle = '#ffffff'
+  context.beginPath()
+  context.moveTo(5,16)
+  context.lineTo(26,16)
+  context.lineTo(26,7)
+  context.lineTo(44,24)
+  context.lineTo(26,41)
+  context.lineTo(26,32)
+  context.lineTo(5,32)
+  context.closePath()
+  context.fill()
+  context.fillStyle = '#1d4ed8'
+  context.beginPath()
+  context.moveTo(9,20)
+  context.lineTo(30,20)
+  context.lineTo(30,16)
+  context.lineTo(39,24)
+  context.lineTo(30,32)
+  context.lineTo(30,28)
+  context.lineTo(9,28)
+  context.closePath()
+  context.fill()
+  return context.getImageData(0, 0, size, size)
 }
 
 // --- scenic places overlay
